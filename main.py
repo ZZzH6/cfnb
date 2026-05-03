@@ -125,6 +125,10 @@ def load_config():
         "PROGRESS_PRINT_INTERVAL": 1,
         "FILTER_COUNTRIES_ENABLED": False,
         "ALLOWED_COUNTRIES": ["US"],
+        "PRE_FILTER_BLOCKED_ENABLED": True,
+        "PRE_FILTER_BLOCKED_COUNTRIES": ["CN"],
+        "PRE_FILTER_PORT_ENABLED": True,
+        "PRE_FILTER_PORTS": [443],
         "ENABLE_WXPUSHER": True,
         "WXPUSHER_APP_TOKEN": "your_app_token_here",
         "WXPUSHER_UIDS": ["your_uid_here"],
@@ -177,6 +181,12 @@ def load_config():
         "GITHUB_SYNC_MAX_RETRIES": 3,
         "GITHUB_SYNC_RETRY_DELAY": 3,
         "GIT_SYNC_PROCESS_TIMEOUT": 180,
+        "AD_HEADER_ENABLED": False,
+        "AD_HEADER_LINES": [],
+        "AD_FOOTER_ENABLED": False,
+        "AD_FOOTER_LINES": [],
+        "AD_PERLINE_ENABLED": False,
+        "AD_PERLINE_TEXT": "",
     }
 
     for key, value in defaults.items():
@@ -199,6 +209,10 @@ SOCKET_DEFAULT_TIMEOUT = cfg["SOCKET_DEFAULT_TIMEOUT"]
 PROGRESS_PRINT_INTERVAL = cfg["PROGRESS_PRINT_INTERVAL"]
 FILTER_COUNTRIES_ENABLED = cfg["FILTER_COUNTRIES_ENABLED"]
 ALLOWED_COUNTRIES = cfg["ALLOWED_COUNTRIES"]
+PRE_FILTER_BLOCKED_ENABLED = cfg["PRE_FILTER_BLOCKED_ENABLED"]
+PRE_FILTER_BLOCKED_COUNTRIES = [c.upper() for c in cfg["PRE_FILTER_BLOCKED_COUNTRIES"]]
+PRE_FILTER_PORT_ENABLED = cfg["PRE_FILTER_PORT_ENABLED"]
+PRE_FILTER_PORTS = [str(p) for p in cfg["PRE_FILTER_PORTS"]]
 ENABLE_WXPUSHER = cfg["ENABLE_WXPUSHER"]
 WXPUSHER_APP_TOKEN = cfg["WXPUSHER_APP_TOKEN"]
 WXPUSHER_UIDS = cfg["WXPUSHER_UIDS"]
@@ -213,7 +227,6 @@ CF_TTL = cfg["CF_TTL"]
 CF_PROXIED = cfg["CF_PROXIED"]
 CF_DNS_CONNECT_TIMEOUT = cfg["CF_DNS_CONNECT_TIMEOUT"]
 CF_DNS_READ_TIMEOUT = cfg["CF_DNS_READ_TIMEOUT"]
-# ADDITIONAL_SOURCES 不在顶层声明，在 main() 中直接使用 cfg.get("ADDITIONAL_SOURCES", [])
 FETCH_MAX_RETRIES = cfg["FETCH_MAX_RETRIES"]
 FETCH_RETRY_DELAY = cfg["FETCH_RETRY_DELAY"]
 FETCH_TIMEOUT = cfg["FETCH_TIMEOUT"]
@@ -247,6 +260,12 @@ DNS_UPDATE_RETRY_DELAY = cfg["DNS_UPDATE_RETRY_DELAY"]
 GITHUB_SYNC_MAX_RETRIES = cfg["GITHUB_SYNC_MAX_RETRIES"]
 GITHUB_SYNC_RETRY_DELAY = cfg["GITHUB_SYNC_RETRY_DELAY"]
 GIT_SYNC_PROCESS_TIMEOUT = cfg["GIT_SYNC_PROCESS_TIMEOUT"]
+AD_HEADER_ENABLED = cfg["AD_HEADER_ENABLED"]
+AD_HEADER_LINES = cfg["AD_HEADER_LINES"]
+AD_FOOTER_ENABLED = cfg["AD_FOOTER_ENABLED"]
+AD_FOOTER_LINES = cfg["AD_FOOTER_LINES"]
+AD_PERLINE_ENABLED = cfg["AD_PERLINE_ENABLED"]
+AD_PERLINE_TEXT = cfg["AD_PERLINE_TEXT"]
 
 socket.setdefaulttimeout(SOCKET_DEFAULT_TIMEOUT)
 BANDWIDTH_URL = BANDWIDTH_URL_TEMPLATE.format(bytes=int(BANDWIDTH_SIZE_MB * 1024 * 1024))
@@ -288,13 +307,17 @@ def extract_country_code(label):
 
     # 1. 优先找标准两位大写字母代码
     for token in tokens:
-        token = token.strip()
-        if re.match(r'^[A-Z]{2}$', token):
-            return token
+        # 清理 token 开头常见的非字母噪音 (数字、空格、短横、点、下划线、竖线、井号等)
+        token_cleaned = re.sub(r'^[\d\s\-_.|#]+', '', token.strip())
+        if re.match(r'^[A-Z]{2}$', token_cleaned):
+            return token_cleaned
 
     # 2. 对每个 token 尝试提取中文名
     for token in tokens:
-        token_no_emoji = re.sub(r'[\U0001F1E6-\U0001F1FF]', '', token).strip()
+        # --- 移除 token 开头常见的非中文噪音 (数字、符号等) ---
+        token_cleaned = re.sub(r'^[\d\s\-_.|#]+', '', token)
+        # ----------------------------------------------------------------
+        token_no_emoji = re.sub(r'[\U0001F1E6-\U0001F1FF]', '', token_cleaned).strip()
         cn_match = re.match(r'^([\u4e00-\u9fff（）()]+)\d*$', token_no_emoji)
         if cn_match:
             cn_name = cn_match.group(1).strip()
@@ -685,7 +708,7 @@ def batch_update_cloudflare_dns(ip_list, ip_info=None, full_bw_results=None, tar
         if cfg.get("FILTER_IPV6_AVAILABILITY", False):
             filter_parts.append(f"IPv6落地过滤({filtered_by_ipv6}个)")
         if cfg.get("FILTER_BLOCKED_COUNTRIES_ENABLED", False):
-            filter_parts.append(f"屏蔽国家过滤({filtered_by_country}个)")
+            filter_parts.append(f"DNS黑名单过滤({filtered_by_country}个)")
         filter_str = " + ".join(filter_parts) if filter_parts else "无过滤"
         print(f"从 {len(full_bw_results)} 个测速节点中筛选出 {len(dns_ip_list)} 个节点用于 DNS 更新（{filter_str}）。")
 
@@ -850,16 +873,34 @@ def sync_to_github():
     )
     print(f"⚠️ 已尝试 {max_retries} 次推送，均失败，请检查网络或 GitHub 仓库状态。")
 
+def write_ip_txt(final_nodes, output_file,
+                 header_enabled, header_lines,
+                 footer_enabled, footer_lines,
+                 perline_enabled, perline_text):
+    """生成包含广告的 ip.txt"""
+    with open(output_file, "w", encoding="utf-8") as f:
+        if header_enabled:
+            for line in header_lines:
+                f.write(line + "\n")
+        for node in final_nodes:
+            if perline_enabled and perline_text:
+                f.write(f"{node}{perline_text}\n")
+            else:
+                f.write(node + "\n")
+        if footer_enabled:
+            for line in footer_lines:
+                f.write(line + "\n")
+
 def main():
     mode_str = f"全局最优{GLOBAL_TOP_N}个" if USE_GLOBAL_MODE else f"每个国家最优{PER_COUNTRY_TOP_N}个"
     print(f"当前模式：{mode_str}，每个节点测试 {TCP_PROBES} 次 TCP 连接")
     print(f"最低成功率要求：{MIN_SUCCESS_RATE*100:.0f}%")
     print(f"IP 可用性二次筛选：{'启用' if TEST_AVAILABILITY else '禁用'}（仅对候选节点）")
     print(f"IPv6 客户端 IP 过滤（仅作用于DNS更新环节）：{'启用' if FILTER_IPV6_AVAILABILITY else '禁用'}")
-    print(f"屏蔽国家过滤（仅作用于DNS更新环节）：{'启用' if FILTER_BLOCKED_COUNTRIES_ENABLED else '禁用'}，屏蔽国家：{', '.join(BLOCKED_COUNTRIES)}")
+    print(f"DNS黑名单过滤：{'启用' if FILTER_BLOCKED_COUNTRIES_ENABLED else '禁用'}，黑名单国家：{', '.join(BLOCKED_COUNTRIES)}")
     print(f"带宽测速候选数：{BANDWIDTH_CANDIDATES}，测速文件大小：{BANDWIDTH_SIZE_MB} MB，超时：{BANDWIDTH_TIMEOUT}s")
     if FILTER_COUNTRIES_ENABLED:
-        print(f"国家过滤：启用，允许国家：{', '.join(ALLOWED_COUNTRIES)}")
+        print(f"前置白名单过滤：启用，仅保留：{', '.join(ALLOWED_COUNTRIES)}")
 
     # 统一从 ADDITIONAL_SOURCES 加载所有数据源
     nodes = []
@@ -881,6 +922,28 @@ def main():
                     seen.add(key)
                     nodes.append(n)
     print(f"合并后总计 {len(nodes)} 个节点。")
+
+    # 前置端口过滤（TCP 测试前仅保留指定端口的节点）
+    if PRE_FILTER_PORT_ENABLED:
+        before = len(nodes)
+        nodes = [n for n in nodes if n.split(':')[1].split('#')[0] in PRE_FILTER_PORTS]
+        after = len(nodes)
+        ports_display = ', '.join(PRE_FILTER_PORTS)
+        print(f"前置端口过滤（仅保留端口 {ports_display}）：{before} -> {after} 个节点")
+        if not nodes:
+            print("⚠️ 前置端口过滤后无任何节点，退出程序。")
+            sys.exit(0)
+
+    # 前置黑名单过滤（TCP测试前剔除指定国家）
+    if PRE_FILTER_BLOCKED_ENABLED and PRE_FILTER_BLOCKED_COUNTRIES:
+        before = len(nodes)
+        blocked_set = set(PRE_FILTER_BLOCKED_COUNTRIES)
+        nodes = [n for n in nodes if n.split('#')[-1].upper() not in blocked_set]
+        after = len(nodes)
+        print(f"前置黑名单过滤：{before} -> {after} 个节点（已屏蔽：{', '.join(sorted(blocked_set))}）")
+        if not nodes:
+            print("⚠️ 前置黑名单过滤后无任何节点，退出程序。")
+            sys.exit(0)
 
     if not nodes:
         print("没有获取到任何有效节点，退出。")
@@ -1001,24 +1064,21 @@ def main():
             else:
                 print(f"{i}. {node} 速度 {speed:.2f} Mbps")
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        for node_str in final_selected:
-            f.write(node_str + "\n")
+    # 使用广告配置生成 ip.txt
+    write_ip_txt(final_selected, OUTPUT_FILE,
+                 AD_HEADER_ENABLED, AD_HEADER_LINES,
+                 AD_FOOTER_ENABLED, AD_FOOTER_LINES,
+                 AD_PERLINE_ENABLED, AD_PERLINE_TEXT)
     print(f"\n结果已保存到 {OUTPUT_FILE}（共 {len(final_selected)} 个节点）")
 
-    ip_list = []
-    try:
-        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
-            ip_list = [line.split(':')[0].strip() for line in f if line.strip()]
-    except Exception as e:
-        print(f"读取 {OUTPUT_FILE} 时发生错误: {e}")
+    # IP 列表直接从最终节点提取，避免广告行干扰 DNS 更新
+    ip_list = [node.split(':')[0] for node in final_selected]
 
-    target_dns_count = GLOBAL_TOP_N if USE_GLOBAL_MODE else PER_COUNTRY_TOP_N
     batch_update_cloudflare_dns(
         ip_list,
         ip_info=avail_ip_info,
         full_bw_results=bw_results,
-        target_count=target_dns_count,
+        target_count=None,
         latency_map=latency_map
     )
 
