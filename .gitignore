@@ -1,4 +1,21 @@
-﻿config.json
-git_sync.ps1
+# -*- coding: utf-8 -*-
+# 本地配置与令牌：永不入库
+config.json
 git_sync.sh
+git_sync.ps1
+valid_tokens.txt
+ipinfo_cache.txt
+
+# 运行日志
+cron.log
+git_sync.log
+*.log
+
+# Python
 __pycache__/
+*.py[cod]
+
+# 本地备份
+cfnb_backup*/
+
+# 注意：ip.txt / akile_jp_ip.txt 是订阅产物，必须保持跟踪，不要加进这里
