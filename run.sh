@@ -13,8 +13,9 @@ cd "$DIR"
 LOG="$DIR/cron.log"
 LOCK="/var/lock/cfnb.lock"
 PYTHON="${CFNB_PYTHON:-/usr/bin/python3}"
-CFG_BACKUP="/root/.config/cfnb/config.backup.json"
-TOKEN_FILE="/root/.config/cfnb/github_token"
+CFG_DIR="/root/.config/cfnb"
+CFG_BACKUP="$CFG_DIR/config.backup.json"
+TOKEN_FILE="$CFG_DIR/github_token"
 
 log() { printf '%s [run.sh] %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
 
@@ -46,6 +47,12 @@ if ! "$PYTHON" -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"
         "$DIR/config.json" >/dev/null 2>&1; then
     log "错误：config.json 不是合法 JSON，本次放弃"
     exit 2
+fi
+
+if [ ! -f "$DIR/git_sync.sh" ] && [ -s "$CFG_DIR/git_sync.sh" ]; then
+    cp -f "$CFG_DIR/git_sync.sh" "$DIR/git_sync.sh"
+    chmod 700 "$DIR/git_sync.sh"
+    log "git_sync.sh 缺失，已从 $CFG_DIR/git_sync.sh 自动恢复"
 fi
 
 for f in main.py git_sync.sh; do
