@@ -24,8 +24,12 @@ import json
 import asyncio
 import aiohttp
 import ipaddress
+import argparse
+import signal
+import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlsplit
 from urllib3.exceptions import InsecureRequestWarning
 
 # 修复 Windows 下 ProactorEventLoop 残留任务报警
@@ -251,7 +255,7 @@ def load_config():
         "DNS_IP_RISK_FILTER_ENABLED": False,
         "DNS_IP_RISK_MAX_LEVEL": "高风险",
         "DNS_UPDATE_TARGET_COUNT": 15,
-        "BANDWIDTH_SIZE_MB": 1.0,
+        "BANDWIDTH_SIZE_MB": 30.0,
         "BANDWIDTH_TIMEOUT": 3,
         "BANDWIDTH_RETRY_MAX": 2,
         "BANDWIDTH_RETRY_DELAY": 3,
@@ -264,6 +268,12 @@ def load_config():
         "AVAILABILITY_WORKERS": 32,
         "FALLBACK_WORKERS": 32,
         "BANDWIDTH_WORKERS": 3,
+        "BANDWIDTH_SCREEN_WORKERS": 12,
+        "BANDWIDTH_SCREEN_KEEP": 45,
+        "BANDWIDTH_SCREEN_SIZE_MB": 8.0,
+        "BANDWIDTH_SAMPLES": 3,
+        "BANDWIDTH_MIN_MBPS": 20,
+        "MAX_NODES_PER_16": 4,
         "HTTP_TEST_WORKERS": 32,
         "DNS_UPDATE_MAX_RETRIES": 3,
         "DNS_UPDATE_RETRY_DELAY": 3,
@@ -286,9 +296,13 @@ def load_config():
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             config = json.load(f)
     except FileNotFoundError:
-        print(f"未找到配置文件 {CONFIG_FILE}，将使用内置默认配置运行。")
-        print(f"你可根据需要创建 config.json 文件（参考文档），程序会自动识别。")
-        return defaults
+        # 内置 defaults 只是占位模板，直接拿来跑会筛出错误节点并静默推送，
+        # 所以这里必须硬失败，而不是"降级继续"。
+        sys.exit(
+            f"错误：找不到配置文件 {CONFIG_FILE}\n"
+            "本项目依赖 config.json（内置默认值只是占位模板）。\n"
+            "请先恢复配置再重试，备份通常在 /root/cfnb_backup_* 目录下。"
+        )
     except json.JSONDecodeError as e:
         print(f"错误：配置文件格式不正确 - {e}")
         sys.exit(1)
@@ -300,7 +314,52 @@ def load_config():
 
     return config
 
-cfg = load_config()
+
+NUMERIC_RANGES = {
+    "TCP_PROBES": (1, 10),
+    "TIMEOUT": (0.5, 30),
+    "MAX_WORKERS": (1, 500),
+    "HTTP_TEST_WORKERS": (1, 200),
+    "AVAILABILITY_WORKERS": (1, 200),
+    "FALLBACK_WORKERS": (1, 200),
+    "BANDWIDTH_WORKERS": (1, 64),
+    "BANDWIDTH_SCREEN_WORKERS": (1, 64),
+    "BANDWIDTH_SCREEN_KEEP": (1, 500),
+    "BANDWIDTH_SAMPLES": (1, 10),
+    "IP_CALIBRATION_CONCURRENCY": (1, 500),
+    "GLOBAL_TOP_N": (1, 200),
+    "BANDWIDTH_CANDIDATES": (1, 2000),
+    "MIN_SUCCESS_RATE": (0.0, 1.0),
+    "BANDWIDTH_SIZE_MB": (0.1, 200.0),
+    "BANDWIDTH_SCREEN_SIZE_MB": (0.1, 200.0),
+    "DNS_UPDATE_TARGET_COUNT": (1, 200),
+}
+
+
+def validate_config(cfg):
+    """启动即校验，避免跑到一半才因配置类型/范围错误崩掉。"""
+    errors = []
+    for key, (low, high) in NUMERIC_RANGES.items():
+        value = cfg.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            errors.append(f"{key} 必须是数字，当前 {value!r}")
+        elif not low <= value <= high:
+            errors.append(f"{key}={value} 超出允许范围 {low}~{high}")
+    if cfg.get("BANDWIDTH_SCREEN_SIZE_MB", 0) > cfg.get("BANDWIDTH_SIZE_MB", 0):
+        errors.append("BANDWIDTH_SCREEN_SIZE_MB 不应大于 BANDWIDTH_SIZE_MB（粗筛样本要≤精测样本）")
+    if "{bytes}" not in cfg.get("BANDWIDTH_URL_TEMPLATE", ""):
+        errors.append("BANDWIDTH_URL_TEMPLATE 必须包含 {bytes} 占位符")
+    sources = cfg.get("ADDITIONAL_SOURCES")
+    if not isinstance(sources, list):
+        errors.append("ADDITIONAL_SOURCES 必须是数组")
+    elif not any(isinstance(s, dict) and s.get("url") for s in sources):
+        errors.append("ADDITIONAL_SOURCES 里没有任何可用的 url")
+    if errors:
+        sys.exit("配置校验失败：\n  - " + "\n  - ".join(errors))
+    return cfg
+
+
+cfg = validate_config(load_config())
 USE_GLOBAL_MODE = cfg["USE_GLOBAL_MODE"]
 GLOBAL_TOP_N = cfg["GLOBAL_TOP_N"]
 PER_COUNTRY_TOP_N = cfg["PER_COUNTRY_TOP_N"]
@@ -342,6 +401,8 @@ IP_CALIBRATION_MIN_INTERVAL = cfg["IP_CALIBRATION_MIN_INTERVAL"]
 IP_CALIBRATION_TOKEN_FILE = cfg["IP_CALIBRATION_TOKEN_FILE"]
 IP_CALIBRATION_CACHE_FILE = cfg["IP_CALIBRATION_CACHE_FILE"]
 OUTPUT_FILE = cfg["OUTPUT_FILE"]
+if not os.path.isabs(OUTPUT_FILE):
+    OUTPUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), OUTPUT_FILE)
 ENABLE_LOGGING = cfg["ENABLE_LOGGING"]
 LOG_FILE = cfg["LOG_FILE"]
 FORCE_DIRECT = cfg["FORCE_DIRECT"]
@@ -385,6 +446,12 @@ MAX_WORKERS = cfg["MAX_WORKERS"]
 AVAILABILITY_WORKERS = cfg["AVAILABILITY_WORKERS"]
 FALLBACK_WORKERS = cfg["FALLBACK_WORKERS"]
 BANDWIDTH_WORKERS = cfg["BANDWIDTH_WORKERS"]
+BANDWIDTH_SCREEN_WORKERS = cfg["BANDWIDTH_SCREEN_WORKERS"]
+BANDWIDTH_SCREEN_KEEP = cfg["BANDWIDTH_SCREEN_KEEP"]
+BANDWIDTH_SCREEN_SIZE_MB = cfg["BANDWIDTH_SCREEN_SIZE_MB"]
+BANDWIDTH_SAMPLES = cfg["BANDWIDTH_SAMPLES"]
+BANDWIDTH_MIN_MBPS = cfg["BANDWIDTH_MIN_MBPS"]
+MAX_NODES_PER_16 = cfg["MAX_NODES_PER_16"]
 HTTP_TEST_WORKERS = cfg["HTTP_TEST_WORKERS"]
 DNS_UPDATE_MAX_RETRIES = cfg["DNS_UPDATE_MAX_RETRIES"]
 DNS_UPDATE_RETRY_DELAY = cfg["DNS_UPDATE_RETRY_DELAY"]
@@ -409,6 +476,35 @@ if FORCE_DIRECT:
 
 socket.setdefaulttimeout(SOCKET_DEFAULT_TIMEOUT)
 BANDWIDTH_URL = BANDWIDTH_URL_TEMPLATE.format(bytes=int(BANDWIDTH_SIZE_MB * 1024 * 1024))
+
+# ==================== 运行期开关（入口处由命令行参数覆盖） ====================
+DRY_RUN = False          # True: 只写结果文件，不改 DNS、不推 git
+FORCE_PROGRESS = False   # True: 输出被重定向时也打印进度
+
+
+def progress(label, completed, total):
+    """cron 下 stdout 是块缓冲的文件，\r 会把日志挤成一行，故非 tty 时不输出。"""
+    if not (FORCE_PROGRESS or sys.stdout.isatty()):
+        return
+    pct = (completed / total * 100) if total else 100.0
+    print(f"\r{label}：{completed}/{total} ({pct:.1f}%)", end="", flush=True)
+
+
+_thread_local = threading.local()
+
+
+def get_session():
+    """每个线程复用一个 requests.Session，省掉每次请求重新 TCP/TLS 握手。"""
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=8, pool_maxsize=8, max_retries=0
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _thread_local.session = session
+    return session
 
 # ====================================================
 
@@ -449,7 +545,7 @@ def get_ip_risk_level(ip):
     """查询单个 IP 的风险等级字符串，失败返回 '未知'"""
     url = f"https://api.ipapi.is/?q={ip}"
     try:
-        resp = requests.get(url, timeout=10)
+        resp = get_session().get(url, timeout=10)
         resp.raise_for_status()
         data = resp.json()
     except Exception:
@@ -559,7 +655,7 @@ def _parse_json_nodes(data):
 
 def _query_country(ip, port):
     try:
-        resp = requests.get(
+        resp = get_session().get(
             AVAILABILITY_CHECK_API,
             params={"proxyip": f"{ip}:{port}"},
             timeout=(AVAILABILITY_CONNECT_TIMEOUT, AVAILABILITY_TIMEOUT)
@@ -666,8 +762,8 @@ def fetch_additional_source(url):
     for attempt in range(1, FETCH_MAX_RETRIES + 1):
         try:
             print(f"正在请求数据源 {url} (尝试 {attempt}/{FETCH_MAX_RETRIES}) ...")
-            headers = {"Accept-Encoding": "gzip, deflate, br, zstd"}
-            resp = requests.get(url, timeout=(FETCH_CONNECT_TIMEOUT, FETCH_TIMEOUT), headers=headers)
+            headers = {"Accept-Encoding": "gzip, deflate"}
+            resp = get_session().get(url, timeout=(FETCH_CONNECT_TIMEOUT, FETCH_TIMEOUT), headers=headers)
             resp.raise_for_status()
             nodes = parse_adaptive(resp.text)
             print(f"从 {url} 解析出 {len(nodes)} 个节点。")
@@ -729,9 +825,10 @@ class IpInfoAsync:
                 await asyncio.sleep(wait)
             self.last_request_time = asyncio.get_event_loop().time()
 
-    async def get_ip_details(self, ip_address):
-        """查询单个 IP 详情，增加本机校验支持，超时直接返回 None"""
-        while True:
+    async def get_ip_details(self, ip_address, max_transient_retries=3):
+        """查询单个 IP 详情；瞬时错误有上限地重试，避免事件循环被永久占住"""
+        transient_errors = 0
+        while transient_errors <= max_transient_retries:
             token = self.current_token
             if token is None:
                 return None
@@ -775,9 +872,13 @@ class IpInfoAsync:
                         }
                 except asyncio.TimeoutError:
                     return None
-                except aiohttp.ClientError as e:
-                    print(f"\n请求 IP {ip_address} 失败: {e}，2秒后重试...")
+                except (aiohttp.ClientError, OSError) as e:
+                    transient_errors += 1
+                    if transient_errors > max_transient_retries:
+                        print(f"\n请求 IP {ip_address} 连续失败 {transient_errors} 次，放弃: {e}")
+                        return None
                     await asyncio.sleep(2)
+        return None
 
 def load_tokens(filepath):
     if not os.path.exists(filepath):
@@ -976,21 +1077,26 @@ def calibrate_regions(nodes, token_file, cache_file):
 # =========================== 核心测试、筛选、测速及更新函数 ===========================
 
 def test_tcp_latency(ip, port, timeout=TIMEOUT, probes=TCP_PROBES):
-    min_latency = float("inf")
-    success = 0
+    """多次探测取中位数：单次连接延迟噪声很大，最小值会系统性偏乐观。"""
+    latencies = []
     for _ in range(probes):
         try:
             start = time.time()
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(timeout)
                 sock.connect((ip, int(port)))
-            latency = time.time() - start
-            if latency < min_latency:
-                min_latency = latency
-            success += 1
+            latencies.append(time.time() - start)
         except Exception:
             continue
-    return min_latency, success
+    if not latencies:
+        return float("inf"), 0
+    latencies.sort()
+    mid = len(latencies) // 2
+    if len(latencies) % 2:
+        median = latencies[mid]
+    else:
+        median = (latencies[mid - 1] + latencies[mid]) / 2
+    return median, len(latencies)
 
 def test_node(node_str):
     m = NODE_PATTERN.match(node_str)
@@ -1018,7 +1124,7 @@ def check_availability(node_str):
 
     for attempt in range(max_attempts):
         try:
-            resp = requests.get(
+            resp = get_session().get(
                 AVAILABILITY_CHECK_API,
                 params={"proxyip": proxyip},
                 timeout=(AVAILABILITY_CONNECT_TIMEOUT, AVAILABILITY_TIMEOUT)
@@ -1049,36 +1155,48 @@ def check_http_server(node_str, timeout, max_retries, retry_delay, method, conne
     }
 
     test_rounds = max(3, HTTP_JITTER_SAMPLES)
+    attempts = (max_retries + 1) if inner_retry_enabled else 1
+    request_kwargs = {
+        "timeout": (connect_timeout, timeout),
+        "verify": False,
+        "allow_redirects": False,
+        "headers": headers
+    }
+    if FORCE_DIRECT:
+        request_kwargs["proxies"] = {"http": None, "https": None}
+
     latencies = []
-    for _ in range(test_rounds):
-        try:
-            start = time.time()
-            request_kwargs = {
-                "timeout": (connect_timeout, timeout),
-                "verify": False,
-                "allow_redirects": False,
-                "headers": headers
-            }
-            if FORCE_DIRECT:
-                request_kwargs["proxies"] = {"http": None, "https": None}
+    reason = "connection_error"
+    for attempt in range(attempts):
+        latencies = []
+        for _round in range(test_rounds):
+            try:
+                start = time.time()
+                if method.upper() == "HEAD":
+                    resp = get_session().head(url, **request_kwargs)
+                else:
+                    resp = get_session().get(url, **request_kwargs)
+                lat = (time.time() - start) * 1000
+                if resp.status_code != 400:
+                    reason = f"status_{resp.status_code}"
+                    break
+                server = resp.headers.get("server", "")
+                if not server.lower().startswith("cloudflare"):
+                    reason = server or "not_cloudflare"
+                    break
+                latencies.append(lat)
+            except Exception:
+                reason = "connection_error"
+                break
 
-            if method.upper() == "HEAD":
-                resp = requests.head(url, **request_kwargs)
-            else:
-                resp = requests.get(url, **request_kwargs)
-
-            lat = (time.time() - start) * 1000
-            if resp.status_code != 400:
-                return (node_str, False, f"status_{resp.status_code}", 0.0, 0.0)
-            server = resp.headers.get("server", "")
-            if not server.lower().startswith("cloudflare"):
-                return (node_str, False, server, 0.0, 0.0)
-            latencies.append(lat)
-        except Exception:
-            return (node_str, False, "connection_error", 0.0, 0.0)
+        if len(latencies) >= test_rounds:
+            break
+        # 单轮抖动不再直接淘汰；按配置重试
+        if attempt < attempts - 1 and retry_delay > 0:
+            time.sleep(retry_delay)
 
     if len(latencies) < test_rounds:
-        return (node_str, False, "not_enough_samples", 0.0, 0.0)
+        return (node_str, False, reason, 0.0, 0.0)
 
     avg_lat = sum(latencies) / len(latencies)
     variance = sum((l - avg_lat) ** 2 for l in latencies) / len(latencies)
@@ -1176,7 +1294,7 @@ def http_server_filter(candidates, config):
                     http_jitter_map[node_str] = http_jitter
                 now = time.time()
                 if now - last_print >= PROGRESS_PRINT_INTERVAL or completed == total:
-                    print(f"\r[HTTP检测] 进度：{completed}/{total} ({(completed/total)*100:.1f}%) 通过数量：{len(passed)}", end="", flush=True)
+                    progress(f"HTTP检测进度（通过 {len(passed)}）", completed, total)
                     last_print = now
 
         print()
@@ -1194,14 +1312,20 @@ def http_server_filter(candidates, config):
     print(f"HTTP检测经 {max_rounds} 轮重试后仍无节点通过，降级使用过滤前候选列表。")
     return candidates, {}, {}
 
-def measure_bandwidth_curl(node_str):
+def measure_bandwidth_curl(node_str, size_mb=None, max_time=None):
+    """返回 (节点, Mbps)。样本太小时传输阶段只有几毫秒，测出来的是噪声，
+    所以这里用「整体平均速度」而不是排除握手后的瞬时速度。"""
     m = IP_PORT_PATTERN.match(node_str)
     if not m:
         return (node_str, 0)
-    ip, port = m.group(1), m.group(2)
+    ip = m.group(1)
 
     null_device = "NUL" if sys.platform == "win32" else "/dev/null"
-    expected_size = BANDWIDTH_SIZE_MB * 1024 * 1024
+    size_mb = BANDWIDTH_SIZE_MB if size_mb is None else size_mb
+    max_time = max(8, int(BANDWIDTH_TIMEOUT)) if max_time is None else max_time
+    expected_size = size_mb * 1024 * 1024
+    url_port = urlsplit(BANDWIDTH_URL).port or 443
+    url = BANDWIDTH_URL_TEMPLATE.format(bytes=int(expected_size))
 
     curl_cmd = [
         "curl", "-s", "-o", null_device,
@@ -1209,33 +1333,58 @@ def measure_bandwidth_curl(node_str):
         "-L",
         "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "--http2",
-        "--resolve", f"speed.cloudflare.com:{port}:{ip}",
-        "--connect-timeout", str(BANDWIDTH_CONNECT_TIMEOUT),
-        "--max-time", str(BANDWIDTH_TIMEOUT),
+        "--resolve", f"speed.cloudflare.com:{url_port}:{ip}",
+        "--connect-timeout", str(max(2, BANDWIDTH_CONNECT_TIMEOUT)),
+        "--max-time", str(max_time),
         "--insecure",
-        BANDWIDTH_URL
+        url
     ]
 
     try:
         result = subprocess.run(curl_cmd, capture_output=True, text=True,
-                                timeout=BANDWIDTH_TIMEOUT + BANDWIDTH_PROCESS_BUFFER)
+                                timeout=max_time + BANDWIDTH_PROCESS_BUFFER)
         if result.returncode == 0 and result.stdout.strip():
             parts = result.stdout.strip().split()
             if len(parts) >= 3:
                 size_bytes = float(parts[0])
-                if size_bytes < expected_size:
+                # 只要求拿到一半样本即可计速，避免把"稍慢"误判成"不通"
+                if size_bytes < expected_size * 0.5:
                     return (node_str, 0)
-                time_starttransfer = float(parts[1])
                 time_total = float(parts[2])
-                transfer_time = time_total - time_starttransfer
-                if transfer_time > 0:
-                    speed_mbps = (size_bytes * 8) / (transfer_time * 1000 * 1000)
-                    return (node_str, speed_mbps)
-    except Exception:
+                if time_total > 0:
+                    return (node_str, (size_bytes * 8) / (time_total * 1000 * 1000))
+    except (subprocess.SubprocessError, ValueError, OSError):
         pass
     return (node_str, 0)
 
+def run_parallel(items, fn, workers, label):
+    """统一的线程池执行；单个任务抛异常不会中断整轮。返回 [(item, result)]。"""
+    total = len(items)
+    if total == 0:
+        return []
+    results = {}
+    completed = 0
+    last_print = time.time()
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, total))) as executor:
+        futures = {executor.submit(fn, item): item for item in items}
+        for future in as_completed(futures):
+            item = futures[future]
+            completed += 1
+            try:
+                results[item] = future.result()
+            except Exception as e:
+                print(f"\n[{label}] {item} 处理失败: {type(e).__name__}: {e}")
+            now = time.time()
+            if now - last_print >= PROGRESS_PRINT_INTERVAL or completed == total:
+                progress(f"{label}进度", completed, total)
+                last_print = now
+    print()
+    return [(item, results[item]) for item in items if item in results]
+
+
 def bandwidth_filter(candidates):
+    """两段式测速：先小样本粗筛掉明显慢的，再用大样本多次取样取中位数。
+    单次 1MB 的传输阶段只有几毫秒，量出来的是噪声，排序会接近随机。"""
     if not candidates:
         return []
 
@@ -1243,26 +1392,44 @@ def bandwidth_filter(candidates):
         print("未检测到 curl 命令，带宽测速将跳过。")
         return []
 
-    print(f"\n开始带宽测速（对前 {len(candidates)} 个节点，并发 {BANDWIDTH_WORKERS}，超时 {BANDWIDTH_TIMEOUT}s）...")
+    screen_size = min(float(BANDWIDTH_SCREEN_SIZE_MB), float(BANDWIDTH_SIZE_MB))
+    screen_max_time = max(8, min(15, int(BANDWIDTH_TIMEOUT)))
+
+    print(f"\n[带宽测速 1/2] 粗筛：{len(candidates)} 个节点 × {screen_size:g}MB，并发 {BANDWIDTH_SCREEN_WORKERS}")
+    screened = [
+        (node, speed)
+        for node, speed in run_parallel(
+            candidates,
+            lambda n: measure_bandwidth_curl(n, size_mb=screen_size, max_time=screen_max_time)[1],
+            BANDWIDTH_SCREEN_WORKERS,
+            "带宽粗筛",
+        )
+        if speed > 0
+    ]
+    screened.sort(key=lambda x: x[1], reverse=True)
+    kept = screened[:BANDWIDTH_SCREEN_KEEP]
+    print(f"粗筛达标 {len(screened)} 个，保留前 {len(kept)} 个进入精测")
+    if not kept:
+        return []
+
+    samples = max(1, int(BANDWIDTH_SAMPLES))
+    print(f"[带宽测速 2/2] 精测：{len(kept)} 个节点 × {BANDWIDTH_SIZE_MB:g}MB × {samples} 次取中位数，"
+          f"并发 {BANDWIDTH_WORKERS}")
+
+    def _sample(node):
+        return [measure_bandwidth_curl(node)[1] for _ in range(samples)]
+
     results = []
-    completed = 0
-    total = len(candidates)
-    last_print = time.time()
+    for node, values in run_parallel([n for n, _ in kept], _sample, BANDWIDTH_WORKERS, "带宽精测"):
+        good = sorted(v for v in values if v > 0)
+        if not good:
+            continue
+        median = good[len(good) // 2]
+        if median >= BANDWIDTH_MIN_MBPS:
+            results.append((node, median))
 
-    with ThreadPoolExecutor(max_workers=BANDWIDTH_WORKERS) as executor:
-        futures = {executor.submit(measure_bandwidth_curl, node): node for node in candidates}
-        for future in as_completed(futures):
-            completed += 1
-            node, speed = future.result()
-            if speed > 0:
-                results.append((node, speed))
-            now = time.time()
-            if now - last_print >= PROGRESS_PRINT_INTERVAL or completed == total:
-                print(f"\r[带宽测速] 进度：{completed}/{total} ({(completed/total)*100:.1f}%)", end="", flush=True)
-                last_print = now
-
-    print()
     results.sort(key=lambda x: x[1], reverse=True)
+    print(f"精测达标（≥{BANDWIDTH_MIN_MBPS:g} Mbps）：{len(results)} 个节点")
     return results
 
 def batch_update_cloudflare_dns(ip_list, ip_info=None, full_bw_results=None, target_count=None, latency_map=None, http_latency_map=None, http_jitter_map=None):
@@ -1450,7 +1617,7 @@ def batch_update_cloudflare_dns(ip_list, ip_info=None, full_bw_results=None, tar
             print(f"\n[DNS 更新] 尝试 {attempt}/{DNS_UPDATE_MAX_RETRIES}...")
             try:
                 list_url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records?type=A&name={CF_DNS_RECORD_NAME}"
-                response = requests.get(list_url, headers=headers, timeout=(CF_DNS_CONNECT_TIMEOUT, CF_DNS_READ_TIMEOUT))
+                response = get_session().get(list_url, headers=headers, timeout=(CF_DNS_CONNECT_TIMEOUT, CF_DNS_READ_TIMEOUT))
                 response.raise_for_status()
                 result = response.json()
                 if not result.get('success'):
@@ -1497,7 +1664,7 @@ def batch_update_cloudflare_dns(ip_list, ip_info=None, full_bw_results=None, tar
             print(f"\n[TXT 记录更新] 尝试 {attempt}/{DNS_UPDATE_MAX_RETRIES}...")
             try:
                 list_url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records?type=TXT&name={CF_DNS_RECORD_NAME}"
-                resp = requests.get(list_url, headers=headers, timeout=(CF_DNS_CONNECT_TIMEOUT, CF_DNS_READ_TIMEOUT))
+                resp = get_session().get(list_url, headers=headers, timeout=(CF_DNS_CONNECT_TIMEOUT, CF_DNS_READ_TIMEOUT))
                 resp.raise_for_status()
                 existing = resp.json().get('result', [])
                 deletes = [{"id": rec["id"]} for rec in existing]
@@ -1566,7 +1733,8 @@ def sync_to_github():
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                creationflags=creationflags
+                creationflags=creationflags,
+                start_new_session=(sys.platform != "win32"),
             )
 
             try:
@@ -1579,8 +1747,19 @@ def sync_to_github():
                     if stderr:
                         print(f"错误信息: {stderr.strip()}")
             except subprocess.TimeoutExpired:
-                process.kill()
-                print(f"推送超时（超过 {GIT_SYNC_PROCESS_TIMEOUT} 秒）")
+                # 只杀 bash 会留下 git push 孤儿进程，下次重试会抢 .git/index.lock
+                try:
+                    if sys.platform != "win32":
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    else:
+                        process.kill()
+                except (ProcessLookupError, PermissionError):
+                    process.kill()
+                try:
+                    process.communicate(timeout=10)   # 收尸并关闭管道
+                except subprocess.TimeoutExpired:
+                    pass
+                print(f"推送超时（超过 {GIT_SYNC_PROCESS_TIMEOUT} 秒），已终止整个进程组")
         except Exception as e:
             print(f"推送过程异常: {e}")
 
@@ -1592,6 +1771,24 @@ def sync_to_github():
         summary="GitHub 推送失败"
     )
     print(f"已尝试 {GITHUB_SYNC_MAX_RETRIES} 次推送，均失败，请检查网络或 GitHub 仓库状态。")
+
+def diversify_by_prefix(ranked_nodes, target, per_prefix_cap=None):
+    """限制同一 /16 段最多入选几个，避免 30 个节点同属一个网段、一起失效。"""
+    cap = MAX_NODES_PER_16 if per_prefix_cap is None else per_prefix_cap
+    picked, overflow, counts = [], [], defaultdict(int)
+    for node in ranked_nodes:
+        prefix = ".".join(node.split(":")[0].split(".")[:2])
+        if counts[prefix] < cap:
+            counts[prefix] += 1
+            picked.append(node)
+        else:
+            overflow.append(node)
+    for node in overflow:
+        if len(picked) >= target:
+            break
+        picked.append(node)
+    return picked[:target]
+
 
 def write_ip_txt(final_nodes, output_file,
                  header_enabled, header_lines,
@@ -1710,7 +1907,7 @@ def main():
                 results.append(res)
             now = time.time()
             if now - last_print >= PROGRESS_PRINT_INTERVAL or completed == total:
-                print(f"\r进度：{completed}/{total} ({(completed/total)*100:.1f}%)", end="", flush=True)
+                progress("TCP 测试进度", completed, total)
                 last_print = now
 
     print("\nTCP 测试完成！")
@@ -1764,7 +1961,7 @@ def main():
         )
         speed_map = {}
         if USE_GLOBAL_MODE:
-            final_selected = [node for node, _, _, _ in results[:GLOBAL_TOP_N]]
+            final_selected = diversify_by_prefix([node for node, _, _, _ in results], GLOBAL_TOP_N)
         else:
             final_selected = []
             for country, nodes in country_nodes.items():
@@ -1773,21 +1970,27 @@ def main():
                     final_selected.append(node_str)
     else:
         speed_map = {node: speed for node, speed in bw_results}
+        # 权重口径：每多 100ms 扣 1.0 倍；速度先归一化到 0~1，否则量纲一大权重就失效
+        REF_MS = 100.0
+        best_speed = max((s for _, s in bw_results), default=0.0) or 1.0
         scored_nodes = []
         for node, speed in bw_results:
-            tcp_lat = latency_map.get(node, 999.0)
-            http_lat = http_latency_map.get(node, 999999.0)
-            http_jitter = http_jitter_map.get(node, 999999.0)
-            http_lat_sec = http_lat / 1000.0
-            http_jitter_sec = http_jitter / 1000.0
-            penalty = 1.0 + TCP_LATENCY_WEIGHT * tcp_lat + HTTP_LATENCY_WEIGHT * http_lat_sec + JITTER_WEIGHT * http_jitter_sec
-            score = (SPEED_WEIGHT * speed) / penalty
-            scored_nodes.append((node, score, speed, tcp_lat, http_lat))
+            tcp_ms = latency_map.get(node)
+            tcp_ms = 50.0 if tcp_ms is None else tcp_ms * 1000.0
+            http_ms = http_latency_map.get(node, 50.0)
+            jitter_ms = http_jitter_map.get(node, 10.0)
+            rel_speed = speed / best_speed
+            penalty = (1.0
+                       + TCP_LATENCY_WEIGHT * tcp_ms / REF_MS
+                       + HTTP_LATENCY_WEIGHT * http_ms / REF_MS
+                       + JITTER_WEIGHT * jitter_ms / REF_MS)
+            score = SPEED_WEIGHT * rel_speed / penalty
+            scored_nodes.append((node, score, speed, tcp_ms / 1000.0, http_ms))
 
         scored_nodes.sort(key=lambda x: x[1], reverse=True)
 
         if USE_GLOBAL_MODE:
-            final_selected = [item[0] for item in scored_nodes[:GLOBAL_TOP_N]]
+            final_selected = diversify_by_prefix([item[0] for item in scored_nodes], GLOBAL_TOP_N)
         else:
             country_scored = defaultdict(list)
             for item in scored_nodes:
@@ -1830,6 +2033,10 @@ def main():
 
     ip_list = [node.split(':')[0] for node in final_selected]
 
+    if DRY_RUN:
+        print("\n[--dry-run] 已跳过 Cloudflare DNS 更新与 GitHub 推送。")
+        return
+
     batch_update_cloudflare_dns(
         ip_list,
         ip_info=avail_ip_info,
@@ -1845,16 +2052,25 @@ def main():
 if __name__ == "__main__":
     import atexit
 
+    parser = argparse.ArgumentParser(description="Cloudflare IP 优选工具")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="只做检测并写出结果文件，不更新 Cloudflare DNS、不推送到 GitHub")
+    parser.add_argument("--progress", action="store_true",
+                        help="输出被重定向时也打印进度（默认只在终端里打印）")
+    args = parser.parse_args()
+    DRY_RUN = args.dry_run
+    FORCE_PROGRESS = args.progress
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(script_dir, LOG_FILE)
     enable_log = ENABLE_LOGGING
     log_filename = LOG_FILE
 
     if enable_log:
         try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            log_path = os.path.join(script_dir, log_filename)
-            log_f = open(log_path, "w", encoding="utf-8")
+            log_f = open(log_path, "a", encoding="utf-8")
             print("日志已启用，输出将保存到 " + log_path)
-        except Exception as e:
+        except OSError as e:
             print(f"无法打开日志文件 {log_path}: {e}")
             log_f = None
         else:
